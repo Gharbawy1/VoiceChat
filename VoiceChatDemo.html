@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Chat</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+
+        input,
+        button {
+            padding: 8px;
+            margin: 5px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+        }
+
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background-color: #0056b3;
+        }
+
+        #roomList .room,
+        #userList .user {
+            padding: 10px;
+            border-bottom: 1px solid #ccc;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        #callStatus,
+        #notifications {
+            margin: 10px 0;
+            font-weight: bold;
+            color: #333;
+        }
+
+        #roomList,
+        #userList,
+        #notifications {
+            margin-top: 10px;
+        }
+
+        #notifications {
+            color: #555;
+            font-style: italic;
+        }
+
+        #loginSection,
+        #mainSection {
+            display: none;
+        }
+
+        #loginSection.active,
+        #mainSection.active {
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div id="loginSection" class="active">
+            <h2>Login</h2>
+            <input type="text" id="userName" placeholder="Enter your name" />
+            <button onclick="login()">Login</button>
+        </div>
+        <div id="mainSection">
+            <h2>Voice Chat</h2>
+            <div>
+                <h3>Available Rooms</h3>
+                <div id="roomList"></div>
+                <h3>Create New Room</h3>
+                <input type="text" id="newRoomId" placeholder="New Room ID" />
+                <button onclick="createRoom()">Create Room</button>
+            </div>
+            <div id="callStatus">Call Status: Disconnected</div>
+            <button onclick="endCall()">End Call</button>
+            <div id="notifications"></div>
+            <div id="userList"></div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+    <script>
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl("https://localhost:7059/voiceChatHub")
+            .withAutomaticReconnect()
+            .build();
+
+        let peerConnection;
+        let localStream;
+        let targetConnectionId;
+        let currentUserId = null;
+        let currentUserName = null;
+        let currentUserConnectionId = null;
+
+        async function login() {
+            const userName = document.getElementById("userName").value;
+            if (!userName) return alert("Please enter a username");
+
+            try {
+                if (connection.state === "Disconnected") {
+                    await connection.start();
+                    console.log("SignalR connection started for login");
+                }
+                await connection.invoke("Login", userName);
+            } catch (err) {
+                console.error("Error during login:", err);
+                alert("Failed to login. Please try again.");
+            }
+        }
+
+        async function joinRoom(roomId) {
+            if (!currentUserId) return alert("Please login first");
+            if (!roomId) return alert("Invalid room ID");
+
+            try {
+                if (connection.state !== "Connected") {
+                    console.log("Starting SignalR connection...");
+                    await connection.start();
+                    console.log("SignalR connection started successfully.");
+                }
+
+                currentUserConnectionId = connection.connectionId;
+                await connection.invoke("JoinRoom", currentUserId, roomId);
+
+                // Setup WebRTC
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                    .then(stream => {
+                        localStream = stream;
+                        peerConnection = new RTCPeerConnection({
+                            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+                        });
+                        stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+
+                        peerConnection.onicecandidate = event => {
+                            if (event.candidate) {
+                                console.log("Sending ICE candidate to", targetConnectionId);
+                                connection.invoke("SendIceCandidate", targetConnectionId, JSON.stringify(event.candidate), roomId)
+                                    .catch(err => console.error("Error sending ICE candidate:", err));
+                            }
+                        };
+
+                        peerConnection.ontrack = event => {
+                            console.log("Received remote stream");
+                            const audio = document.createElement("audio");
+                            audio.srcObject = event.streams[0];
+                            audio.autoplay = true;
+                            document.body.appendChild(audio);
+                        };
+                    })
+                    .catch(err => console.error("Error accessing media devices:", err));
+
+                connection.invoke("GetRooms");
+            } catch (err) {
+                console.error("Error joining room:", err);
+            }
+        }
+
+        async function createRoom() {
+            const roomId = document.getElementById("newRoomId").value;
+            if (roomId) {
+                joinRoom(roomId);
+            } else {
+                alert("Please enter a room ID");
+            }
+        }
+
+        async function startCall(targetId) {
+            if (!targetId) {
+                console.error("Invalid targetConnectionId");
+                alert("Cannot start call: Invalid target user.");
+                return;
+            }
+            if (connection.state !== "Connected") {
+                console.error("SignalR connection not active");
+                alert("Cannot start call: SignalR connection not active.");
+                return;
+            }
+
+            targetConnectionId = targetId;
+            const roomId = document.getElementById("newRoomId").value || "defaultRoom";
+            document.getElementById("callStatus").textContent = "Call Status: Connecting...";
+            console.log("Starting call to", targetId);
+
+            try {
+                connection.invoke("UpdateCallStatus", targetId, "Connecting", roomId)
+                    .catch(err => console.error("Error updating call status:", err));
+
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                console.log("Sending offer to", targetId);
+                await connection.invoke("SendOffer", targetId, JSON.stringify(offer), roomId);
+            } catch (err) {
+                console.error("Error starting call:", err);
+                document.getElementById("callStatus").textContent = "Call Status: Failed";
+            }
+        }
+
+        function endCall() {
+            if (peerConnection) {
+                const roomId = document.getElementById("newRoomId").value || "defaultRoom";
+                console.log("Ending call with", targetConnectionId);
+                connection.invoke("EndCall", currentUserName, targetConnectionId, roomId)
+                    .catch(err => console.error("Error ending call:", err));
+
+                peerConnection.close();
+                peerConnection = null;
+                document.getElementById("callStatus").textContent = "Call Status: Disconnected";
+                connection.invoke("UpdateCallStatus", targetConnectionId, "Disconnected", roomId)
+                    .catch(err => console.error("Error updating call status:", err));
+                targetConnectionId = null;
+            }
+        }
+
+        connection.on("LoginSuccess", userId => {
+            console.log("Login successful, userId:", userId);
+            currentUserId = userId;
+            currentUserName = document.getElementById("userName").value;
+            document.getElementById("loginSection").classList.remove("active");
+            document.getElementById("mainSection").classList.add("active");
+        });
+
+        connection.on("ReceiveRooms", rooms => {
+            console.log("Received rooms:", rooms);
+            const roomList = document.getElementById("roomList");
+            roomList.innerHTML = "";
+            rooms.forEach(room => {
+                const roomDiv = document.createElement("div");
+                roomDiv.className = "room";
+                roomDiv.innerHTML = `${room.name} <button onclick="joinRoom('${room.id}')">Join</button>`;
+                roomList.appendChild(roomDiv);
+            });
+        });
+
+        connection.on("UserJoined", (userName, connectionId) => {
+            console.log("User joined:", { userName, connectionId });
+            // Handled by UpdateRoomUsers
+        });
+
+        connection.on("UpdateRoomUsers", users => {
+            console.log("Updating room users:", users);
+            const userList = document.getElementById("userList");
+            userList.innerHTML = "";
+            users.forEach(user => {
+                const userName = user.value || "Unknown User";
+                const connectionId = user.key;
+                console.log("Adding user:", { userName, connectionId });
+                if (!connectionId || !userName) {
+                    console.warn("Received invalid user data:", user);
+                    return;
+                }
+                const userDiv = document.createElement("div");
+                userDiv.className = "user";
+                userDiv.setAttribute("data-connection-id", connectionId);
+                if (connectionId === currentUserConnectionId) {
+                    userDiv.innerHTML = `${userName} <span>You</span>`;
+                } else {
+                    userDiv.innerHTML = `${userName} <button onclick="startCall('${connectionId}')">Call</button>`;
+                }
+                userList.appendChild(userDiv);
+            });
+        });
+
+        connection.on("NotifyUserJoined", userName => {
+            console.log(`${userName} joined the room`);
+            const notifications = document.getElementById("notifications");
+            notifications.innerHTML = `${userName} joined the room`;
+            setTimeout(() => { notifications.innerHTML = ""; }, 3000);
+        });
+
+        connection.on("NotifyUserLeft", userName => {
+            console.log(`${userName} left the room`);
+            const notifications = document.getElementById("notifications");
+            notifications.innerHTML = `${userName} left the room`;
+            setTimeout(() => { notifications.innerHTML = ""; }, 3000);
+        });
+
+        connection.on("ReceiveOffer", async (fromConnectionId, sdp, roomId) => {
+            console.log("Received offer from", fromConnectionId);
+            targetConnectionId = fromConnectionId;
+            try {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(JSON.parse(sdp)));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                document.getElementById("callStatus").textContent = "Call Status: Connected";
+                connection.invoke("UpdateCallStatus", fromConnectionId, "Connected", roomId)
+                    .catch(err => console.error("Error updating call status:", err));
+                connection.invoke("SendAnswer", fromConnectionId, JSON.stringify(answer), roomId)
+                    .catch(err => console.error("Error sending answer:", err));
+            } catch (err) {
+                console.error("Error handling offer:", err);
+            }
+        });
+
+        connection.on("ReceiveAnswer", async (fromConnectionId, sdp, roomId) => {
+            console.log("Received answer from", fromConnectionId);
+            try {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(JSON.parse(sdp)));
+                document.getElementById("callStatus").textContent = "Call Status: Connected";
+            } catch (err) {
+                console.error("Error handling answer:", err);
+            }
+        });
+
+        connection.on("ReceiveIceCandidate", async (fromConnectionId, candidate) => {
+            console.log("Received ICE candidate from", fromConnectionId);
+            try {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(JSON.parse(candidate)));
+            } catch (err) {
+                console.error("Error adding ICE candidate:", err);
+            }
+        });
+
+        connection.on("ReceiveCallStatus", (fromConnectionId, status) => {
+            console.log("Received call status:", status, "from", fromConnectionId);
+            document.getElementById("callStatus").textContent = `Call Status: ${status}`;
+        });
+
+        connection.on("UserLeft", (userName, connectionId) => {
+            console.log("User left:", { userName, connectionId });
+            const userDiv = document.querySelector(`[data-connection-id="${connectionId}"]`);
+            if (userDiv) userDiv.remove();
+        });
+    </script>
+</body>
+
+</html>

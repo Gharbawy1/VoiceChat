@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Real-Time Demo</title>
+</head>
+
+<body>
+    <h1>Real-Time Chat Demo</h1>
+
+    <div id="loginSection">
+        <input id="phoneNumber" placeholder="Your Phone Number" type="text" />
+        <input id="password" placeholder="Your Password" type="password" />
+        <button onclick="login()">Login</button>
+    </div>
+
+    <div id="userSection" style="display:none;">
+        <input id="ticketDetails" placeholder="Ticket Details" />
+        <button onclick="submitTicket()">Submit Ticket</button>
+    </div>
+
+    <div id="adminSection" style="display:none">
+        <h2>Admin Panel</h2>
+        <ul id="ticketList"></ul>
+        <div id="adminAddUserSection" style="display:none">
+            <input type="text" id="adminUserNameToAdd" placeholder="Enter username to add">
+            <button onclick="requestAddUser()">Add User</button>
+        </div>
+    </div>
+
+    <div id="chatSection" style="display:none;">
+        <h3>Chat</h3>
+        <div id="messages"></div>
+        <input id="messageInput" placeholder="Type a message" />
+        <button onclick="sendMessage()">Send</button>
+        <input id="userNameToAdd" placeholder="Enter username to add" style="display:none;" />
+        <button id="requestAddUserBtn" style="display:none;" onclick="requestAddUser()">Request to Add User</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/6.0.1/signalr.min.js"></script>
+    <script>
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl("https://localhost:7064/chatHub", { accessTokenFactory: () => token })
+            .withAutomaticReconnect()
+            .build();
+
+        let chatId = localStorage.getItem("chatId") || null;
+        let token = localStorage.getItem("token") || null;
+        let lastTicketId = null;
+        let currentUser = null;
+        let lastMessage = null;
+
+
+        // Load Messages from Backend
+        function loadMessages(chatId) {
+            fetch(`https://localhost:7064/api/tickets/messages/${chatId}`, {
+                headers: { "Authorization": `Bearer ${token}` }
+            })
+                .then(response => response.json())
+                .then(messages => {
+                    const messagesDiv = document.getElementById("messages");
+                    messagesDiv.innerHTML = "";
+                    messages.forEach(msg => {
+                        messagesDiv.innerHTML += `<p><strong>${msg.userName}:</strong> ${msg.body}</p>`;
+                    });
+                })
+                .catch(err => console.error("Load Messages Error: ", err));
+        }
+
+
+        // SignalR Events
+        connection.on("ChatStarted", (newChatId) => {
+            chatId = newChatId;
+            localStorage.setItem("chatId", chatId);
+            document.getElementById("chatSection").style.display = "block";
+            ensureConnection().then(() => {
+                connection.invoke("JoinChat", chatId)
+                    .then(() => {
+                        console.log(`Joined chat ${chatId}`);
+                        loadMessages(chatId);
+                    })
+                    .catch(err => console.error("JoinChat Error: ", err));
+                if (currentUser.role === "Admin") {
+                    document.getElementById("adminAddUserSection").style.display = "block";
+                } else {
+                    document.getElementById("userNameToAdd").style.display = "block";
+                    document.getElementById("requestAddUserBtn").style.display = "block";
+                }
+            });
+        });
+
+        connection.on("ReceiveMessage", (user, message) => {
+            const fullMessage = `User ${user}: ${message}`;
+            if (fullMessage !== lastMessage) {
+                const messagesDiv = document.getElementById("messages");
+                messagesDiv.innerHTML += `<p><strong>User ${user}:</strong> ${message}</p>`;
+                lastMessage = fullMessage;
+            }
+        });
+
+        connection.on("NewAddUserRequest", (requestId) => {
+            if (currentUser.role === "Admin") {
+                loadAddUserRequests();
+            }
+        });
+
+        function ensureConnection() {
+            if (connection.state === signalR.HubConnectionState.Disconnected) {
+                return connection.start()
+                    .then(() => {
+                        console.log("Connected to SignalR");
+                        if (currentUser) {
+                            connection.invoke("JoinChat", `user_${currentUser.id}`)
+                                .then(() => console.log(`Joined group user_${currentUser.id}`))
+                                .catch(err => console.error("JoinChat Error: ", err));
+                            if (currentUser.role === "Admin") {
+                                connection.invoke("JoinAdminGroup")
+                                    .catch(err => console.error("JoinAdminGroup Error: ", err));
+                            }
+                            if (chatId) {
+                                connection.invoke("JoinChat", chatId)
+                                    .then(() => {
+                                        console.log(`Rejoined chat ${chatId}`);
+                                        loadMessages(chatId);
+                                        document.getElementById("chatSection").style.display = "block";
+                                        if (currentUser.role === "Admin") {
+                                            document.getElementById("adminAddUserSection").style.display = "block";
+                                        } else {
+                                            document.getElementById("userNameToAdd").style.display = "block";
+                                            document.getElementById("requestAddUserBtn").style.display = "block";
+                                        }
+                                    })
+                                    .catch(err => console.error("Rejoin Chat Error: ", err));
+                            }
+                        }
+                    })
+                    .catch(err => console.error("SignalR Start Error: ", err));
+            }
+            return Promise.resolve();
+        }
+
+        function login() {
+            const phoneNumber = document.getElementById("phoneNumber").value.trim();
+            const password = document.getElementById("password").value.trim();
+            if (!phoneNumber || !password) {
+                alert("Please enter phone number and password");
+                return;
+            }
+
+            fetch("https://localhost:7064/api/account/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ phoneNumber, password })
+            })
+                .then(response => {
+                    if (!response.ok) throw new Error("Login failed: " + response.statusText);
+                    return response.json();
+                })
+                .then(data => {
+                    token = data.data.token;
+                    const tokenData = parseJwt(token);
+                    currentUser = {
+                        id: tokenData["nameid"],
+                        username: tokenData["given_name"],
+                        role: tokenData["role"]
+                    };
+                    localStorage.setItem("token", token);
+                    document.getElementById("loginSection").style.display = "none";
+                    if (currentUser.role === "Admin") {
+                        document.getElementById("adminSection").style.display = "block";
+                        loadTickets();
+                        ensureConnection().then(() => {
+                            connection.invoke("JoinAdminGroup")
+                                .catch(err => console.error("JoinAdminGroup Error: ", err));
+                            connection.invoke("JoinChat", `user_${currentUser.id}`)
+                                .then(() => console.log(`Admin joined user_${currentUser.id}`))
+                                .catch(err => console.error("Admin JoinChat Error: ", err));
+                        });
+                        // أضف Input للـ Admin
+                        document.getElementById("adminAddUserSection").style.display = "block";
+                    } else {
+                        document.getElementById("userSection").style.display = "block";
+                        ensureConnection().then(() => {
+                            connection.invoke("JoinChat", `user_${currentUser.id}`)
+                                .then(() => console.log(`User ${currentUser.id} joined their group`))
+                                .catch(err => console.error("Initial JoinChat Error: ", err));
+                        });
+                    }
+                })
+                .catch(err => {
+                    console.error("Login Error: ", err);
+                    alert("Login failed: " + err.message);
+                });
+        }
+
+
+        function submitTicket() {
+            const details = document.getElementById("ticketDetails").value;
+            fetch("https://localhost:7064/api/tickets/request", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${token}`
+                },
+                body: JSON.stringify({ details })
+            })
+                .then(response => response.json())
+                .then(data => {
+                    alert(data.message);
+                    lastTicketId = data.requestId;
+                    console.log("Ticket ID: " + lastTicketId);
+                })
+                .catch(err => console.error("Submit Error: ", err));
+        }
+
+        function approveTicket(ticketId) {
+            fetch(`https://localhost:7064/api/tickets/approve/${ticketId}`, {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${token}` }
+            })
+                .then(response => response.json())
+                .then(data => {
+                    alert(data.message);
+                    loadTickets();
+                    chatId = data.chatId;
+                    localStorage.setItem("chatId", chatId);
+                    if (currentUser.role === "Admin") {
+                        chatId = data.chatId;
+                        document.getElementById("chatSection").style.display = "block";
+                        ensureConnection().then(() => {
+                            connection.invoke("JoinChat", chatId)
+                                .then(() => {
+                                    console.log(`Admin joined chat ${chatId}`); loadMessages(chatId);
+                                })
+                                .catch(err => console.error("Admin JoinChat Error: ", err));
+                            document.getElementById("userList").style.display = "block";
+                            document.getElementById("addUserBtn").style.display = "block";
+                        });
+                    }
+                })
+                .catch(err => console.error("Approve Error: ", err));
+        }
+
+        function requestAddUser() {
+            const userNameToAdd = document.getElementById(currentUser.role === "Admin" ? "adminUserNameToAdd" : "userNameToAdd").value.trim();
+            if (!userNameToAdd) {
+                alert("Please enter a username");
+                return;
+            }
+
+            fetch(`https://localhost:7064/api/tickets/find-user-by-userName/${encodeURIComponent(userNameToAdd)}`, {
+                headers: { "Authorization": `Bearer ${token}` }
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        return response.json().then(err => { throw new Error(err.title || "User not found"); });
+                    }
+                    return response.json();
+                })
+                .then(user => {
+                    const userIdToAdd = user.id;
+                    if (currentUser.role === "Admin") {
+                        // الـ Admin يضيف المستخدم فورًا للـ Chat
+                        return fetch("https://localhost:7064/api/tickets/add-user-to-chat", {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                                "Authorization": `Bearer ${token}`
+                            },
+                            body: JSON.stringify({ userIdToAdd, chatId })
+                        });
+                    } else {
+                        // الـ User يبعت Request للـ Admin
+                        return fetch("https://localhost:7064/api/tickets/request-add-user", {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                                "Authorization": `Bearer ${token}`
+                            },
+                            body: JSON.stringify({ userIdToAdd, chatId })
+                        });
+                    }
+                })
+                .then(response => response.json())
+                .then(data => {
+                    alert(data.message);
+                    document.getElementById(currentUser.role === "Admin" ? "adminUserNameToAdd" : "userNameToAdd").value = "";
+                })
+                .catch(err => {
+                    console.error("Request Add User Error: ", err);
+                    alert(err.message || "User not found or request failed");
+                });
+        }
+
+
+        function loadAddUserRequests() {
+            fetch(`https://localhost:7064/api/tickets/get-add-user-requests`, {
+                headers: { "Authorization": `Bearer ${token}` }
+            })
+                .then(response => response.json())
+                .then(requests => {
+                    const ticketList = document.getElementById("ticketList");
+                    requests.forEach(req => {
+                        const li = document.createElement("li");
+                        li.innerHTML = `User ${req.requestingUserId} wants to add User ${req.userIdToAdd} to Chat ${req.chatId} <button onclick="approveAddUserRequest(${req.id})">Approve</button>`;
+                        ticketList.appendChild(li);
+                    });
+                })
+                .catch(err => console.error("Load Add User Requests Error: ", err));
+        }
+
+        function approveAddUserRequest(requestId) {
+            fetch(`https://localhost:7064/api/tickets/approve-add-user/${requestId}`, {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${token}` }
+            })
+                .then(response => response.json())
+                .then(data => {
+                    alert(data.message);
+                    loadAddUserRequests();
+                    loadUsers();
+                })
+                .catch(err => console.error("Approve Add User Error: ", err));
+        }
+
+        function loadTickets() {
+            fetch(`https://localhost:7064/api/tickets/GetAllTickets`, {
+                headers: { "Authorization": `Bearer ${token}` }
+            })
+                .then(response => {
+                    if (!response.ok) throw new Error("Unauthorized");
+                    return response.json();
+                })
+                .then(tickets => {
+                    const ticketList = document.getElementById("ticketList");
+                    ticketList.innerHTML = "";
+                    tickets.forEach(ticket => {
+                        const li = document.createElement("li");
+                        li.innerHTML = `${ticket.details} (User: ${ticket.username}) <button onclick="approveTicket(${ticket.id})">Approve</button>`;
+                        ticketList.appendChild(li);
+                    });
+                })
+                .catch(err => console.error("Load Tickets Error: ", err));
+        }
+
+        function sendMessage() {
+            ensureConnection().then(() => {
+                const message = document.getElementById("messageInput").value;
+                connection.invoke("SendMessage", chatId, message)
+                    .then(() => document.getElementById("messageInput").value = "")
+                    .catch(err => console.error("Send Message Error: ", err));
+            });
+        }
+
+        function addUserToChat() {
+            const userIdToAdd = parseInt(document.getElementById("userList").value);
+            ensureConnection().then(() => {
+                connection.invoke("AddUserToChat", chatId, userIdToAdd)
+                    .then(() => {
+                        console.log(`User ${userIdToAdd} added to chat ${chatId}`);
+                        loadUsers();
+                    })
+                    .catch(err => console.error("Add User Error: ", err));
+            });
+        }
+
+        function parseJwt(token) {
+
+            const tokenData = parseJwt(token);
+            currentUser = {
+                id: tokenData["nameid"],
+                username: tokenData["given_name"],
+                role: tokenData["role"]
+            };
+            document.getElementById("loginSection").style.display = "none";
+            if (currentUser.role === "Admin") {
+                document.getElementById("adminSection").style.display = "block";
+                loadTickets();
+            } else {
+                document.getElementById("userSection").style.display = "block";
+            }
+            ensureConnection();
+        }
+
+    </script>
+</body>
+
+</html>
